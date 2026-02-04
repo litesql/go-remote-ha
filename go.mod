@@ -1,6 +1,6 @@
 module github.com/litesql/go-remote-ha
 
-go 1.25.6
+go 1.25
 
 require (
 	connectrpc.com/connect v1.19.1
