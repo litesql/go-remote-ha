@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql/driver"
 	"errors"
+	"fmt"
 	"io"
 
 	"connectrpc.com/connect"
@@ -96,9 +97,20 @@ func (c *conn) Begin() (driver.Tx, error) {
 }
 
 func (c *conn) BeginTx(ctx context.Context, opts driver.TxOptions) (driver.Tx, error) {
+	ex := c.newExecutor()
+	resp := ex.exec(ctx, &sqlv1.QueryRequest{
+		Type: sqlv1.QueryType_QUERY_TYPE_EXEC_QUERY,
+		Sql:  "BEGIN",
+	})
+	if resp.Error != "" {
+		if resp.BadConn {
+			return nil, fmt.Errorf("%w: %s", driver.ErrBadConn, resp.Error)
+		}
+		return nil, errors.New(resp.Error)
+	}
 	return &tx{
 		ctx: ctx,
-		ex:  c.newExecutor(),
+		ex:  ex,
 	}, nil
 }
 
