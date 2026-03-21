@@ -6,9 +6,10 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"time"
 
-	"connectrpc.com/connect"
 	sqlv1 "github.com/litesql/go-ha/api/sql/v1"
+	"google.golang.org/grpc"
 )
 
 type streamResponse struct {
@@ -17,18 +18,19 @@ type streamResponse struct {
 }
 
 type conn struct {
-	stream     *connect.BidiStreamForClient[sqlv1.QueryRequest, sqlv1.QueryResponse]
+	stream     grpc.BidiStreamingClient[sqlv1.QueryRequest, sqlv1.QueryResponse]
 	cancel     func()
 	requestCh  chan *sqlv1.QueryRequest
 	responseCh chan *streamResponse
+	badConn    bool
 }
 
-func newConn(stream *connect.BidiStreamForClient[sqlv1.QueryRequest, sqlv1.QueryResponse], cancel func()) *conn {
+func newConn(stream grpc.BidiStreamingClient[sqlv1.QueryRequest, sqlv1.QueryResponse], cancel func()) *conn {
 	requestCh := make(chan *sqlv1.QueryRequest)
 	responseCh := make(chan *streamResponse)
 	go func() {
 		for {
-			resp, err := stream.Receive()
+			resp, err := stream.Recv()
 			if err != nil {
 				if err == io.EOF {
 					return
@@ -47,27 +49,41 @@ func newConn(stream *connect.BidiStreamForClient[sqlv1.QueryRequest, sqlv1.Query
 		}
 	}()
 
-	go func() {
-		for req := range requestCh {
-			err := stream.Send(req)
-			if err != nil {
-				responseCh <- &streamResponse{
-					BadConn: true,
-					QueryResponse: &sqlv1.QueryResponse{
-						Error: err.Error(),
-					},
-				}
-				return
-			}
-		}
-	}()
-
-	return &conn{
+	c := &conn{
 		stream:     stream,
 		cancel:     cancel,
 		requestCh:  requestCh,
 		responseCh: responseCh,
 	}
+
+	go func() {
+		for {
+			select {
+			case req := <-requestCh:
+				err := stream.Send(req)
+				if err != nil {
+					responseCh <- &streamResponse{
+						BadConn: true,
+						QueryResponse: &sqlv1.QueryResponse{
+							Error: err.Error(),
+						},
+					}
+					return
+				}
+			case <-time.After(25 * time.Second):
+				ex := c.newExecutor()
+				resp := ex.exec(context.Background(), &sqlv1.QueryRequest{
+					Type: sqlv1.QueryType_QUERY_TYPE_PING,
+				})
+				if resp.BadConn {
+					c.badConn = true
+					return
+				}
+			}
+		}
+	}()
+
+	return c
 }
 
 func (c *conn) Prepare(query string) (driver.Stmt, error) {
@@ -78,18 +94,14 @@ func (c *conn) newExecutor() *executor {
 	return &executor{
 		requestCh:  c.requestCh,
 		responseCh: c.responseCh,
+		badConn:    c.badConn,
 	}
 }
 
 func (c *conn) Close() error {
-	streamConn, err := c.stream.Conn()
-	if err == nil {
-		err = errors.Join(err, streamConn.CloseRequest())
-		err = errors.Join(err, streamConn.CloseResponse())
-	}
 	c.cancel()
 	close(c.requestCh)
-	return err
+	return c.stream.CloseSend()
 }
 
 func (c *conn) Begin() (driver.Tx, error) {
@@ -136,9 +148,18 @@ func (c *conn) Ping(ctx context.Context) error {
 type executor struct {
 	requestCh  chan *sqlv1.QueryRequest
 	responseCh chan *streamResponse
+	badConn    bool
 }
 
 func (e *executor) exec(ctx context.Context, req *sqlv1.QueryRequest) *streamResponse {
+	if e.badConn {
+		return &streamResponse{
+			BadConn: true,
+			QueryResponse: &sqlv1.QueryResponse{
+				Error: "bad connection",
+			},
+		}
+	}
 	go func() {
 		select {
 		case e.requestCh <- req:
