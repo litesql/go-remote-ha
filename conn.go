@@ -18,14 +18,15 @@ type streamResponse struct {
 }
 
 type conn struct {
-	stream     grpc.BidiStreamingClient[sqlv1.QueryRequest, sqlv1.QueryResponse]
-	cancel     func()
-	requestCh  chan *sqlv1.QueryRequest
-	responseCh chan *streamResponse
-	badConn    bool
+	stream        grpc.BidiStreamingClient[sqlv1.QueryRequest, sqlv1.QueryResponse]
+	cancel        func()
+	requestCh     chan *sqlv1.QueryRequest
+	responseCh    chan *streamResponse
+	replicationID string
+	badConn       bool
 }
 
-func newConn(stream grpc.BidiStreamingClient[sqlv1.QueryRequest, sqlv1.QueryResponse], cancel func()) *conn {
+func newConn(replicationID string, stream grpc.BidiStreamingClient[sqlv1.QueryRequest, sqlv1.QueryResponse], cancel func()) *conn {
 	requestCh := make(chan *sqlv1.QueryRequest)
 	responseCh := make(chan *streamResponse)
 	go func() {
@@ -50,12 +51,12 @@ func newConn(stream grpc.BidiStreamingClient[sqlv1.QueryRequest, sqlv1.QueryResp
 	}()
 
 	c := &conn{
-		stream:     stream,
-		cancel:     cancel,
-		requestCh:  requestCh,
-		responseCh: responseCh,
+		stream:        stream,
+		cancel:        cancel,
+		requestCh:     requestCh,
+		responseCh:    responseCh,
+		replicationID: replicationID,
 	}
-
 	go func() {
 		for {
 			select {
@@ -92,9 +93,10 @@ func (c *conn) Prepare(query string) (driver.Stmt, error) {
 
 func (c *conn) newExecutor() *executor {
 	return &executor{
-		requestCh:  c.requestCh,
-		responseCh: c.responseCh,
-		badConn:    c.badConn,
+		requestCh:     c.requestCh,
+		responseCh:    c.responseCh,
+		badConn:       c.badConn,
+		replicationID: c.replicationID,
 	}
 }
 
@@ -146,9 +148,10 @@ func (c *conn) Ping(ctx context.Context) error {
 }
 
 type executor struct {
-	requestCh  chan *sqlv1.QueryRequest
-	responseCh chan *streamResponse
-	badConn    bool
+	requestCh     chan *sqlv1.QueryRequest
+	responseCh    chan *streamResponse
+	replicationID string
+	badConn       bool
 }
 
 func (e *executor) exec(ctx context.Context, req *sqlv1.QueryRequest) *streamResponse {
@@ -160,6 +163,7 @@ func (e *executor) exec(ctx context.Context, req *sqlv1.QueryRequest) *streamRes
 			},
 		}
 	}
+	req.ReplicationId = e.replicationID
 	go func() {
 		select {
 		case e.requestCh <- req:

@@ -53,6 +53,8 @@ func doConnect(ctx context.Context, name string) (driver.Conn, error) {
 		return nil, fmt.Errorf("parse url: %w", err)
 	}
 
+	replicationID := strings.TrimPrefix(u.Path, "/")
+
 	opts := make([]grpc.DialOption, 0)
 	if strings.HasPrefix(name, "http://") {
 		opts = append(opts, grpc.WithTransportCredentials(insecure.NewCredentials()))
@@ -80,7 +82,7 @@ func doConnect(ctx context.Context, name string) (driver.Conn, error) {
 		cancel()
 		return nil, fmt.Errorf("create query stream: %w", err)
 	}
-	return newConn(queryStream, cancel), nil
+	return newConn(replicationID, queryStream, cancel), nil
 }
 
 type grpcCredentials struct {
