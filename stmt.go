@@ -3,17 +3,29 @@ package remoteha
 import (
 	"context"
 	"database/sql/driver"
-	"errors"
 	"fmt"
 	"io"
+	"math"
+	"strconv"
+	"time"
 
 	sqlv1 "github.com/litesql/go-ha/api/sql/v1"
 	haconnect "github.com/litesql/go-ha/connect"
 )
 
+var (
+	_ driver.Stmt              = (*stmt)(nil)
+	_ driver.StmtExecContext   = (*stmt)(nil)
+	_ driver.StmtQueryContext  = (*stmt)(nil)
+	_ driver.NamedValueChecker = (*stmt)(nil)
+	_ driver.Result            = (*result)(nil)
+	_ driver.Rows              = (*rows)(nil)
+	_ driver.Tx                = (*tx)(nil)
+)
+
 type stmt struct {
 	query string
-	ex    *executor
+	conn  *conn
 }
 
 func (s *stmt) Close() error {
@@ -33,50 +45,31 @@ func (s *stmt) Query(args []driver.Value) (driver.Rows, error) {
 }
 
 func (s *stmt) ExecContext(ctx context.Context, args []driver.NamedValue) (driver.Result, error) {
-	params, err := toParams(args)
-	if err != nil {
-		return nil, err
-	}
-
-	resp := s.ex.exec(ctx, &sqlv1.QueryRequest{
-		Type:   sqlv1.QueryType_QUERY_TYPE_EXEC_UPDATE,
-		Sql:    s.query,
-		Params: params,
-	})
-	if resp.Error != "" {
-		if resp.BadConn {
-			return nil, fmt.Errorf("%w: %s", driver.ErrBadConn, resp.Error)
-		}
-		return nil, errors.New(resp.Error)
-	}
-	return result{
-		rowsAffected: resp.RowsAffected,
-	}, nil
+	return s.conn.execContext(ctx, s.query, args)
 }
 
 func (s *stmt) QueryContext(ctx context.Context, args []driver.NamedValue) (driver.Rows, error) {
-	params, err := toParams(args)
-	if err != nil {
-		return nil, err
-	}
-
-	resp := s.ex.exec(ctx, &sqlv1.QueryRequest{
-		Type:   sqlv1.QueryType_QUERY_TYPE_EXEC_QUERY,
-		Sql:    s.query,
-		Params: params,
-	})
-	if resp.Error != "" {
-		if resp.BadConn {
-			return nil, fmt.Errorf("%w: %s", driver.ErrBadConn, resp.Error)
-		}
-		return nil, errors.New(resp.Error)
-	}
-
-	return &rows{data: resp.ResultSet}, nil
+	return s.conn.queryContext(ctx, s.query, args)
 }
 
-func toNamedValues(vals []driver.Value) (r []driver.NamedValue) {
-	r = make([]driver.NamedValue, len(vals))
+func (s *stmt) CheckNamedValue(nv *driver.NamedValue) error {
+	return checkNamedValue(nv)
+}
+
+func checkNamedValue(nv *driver.NamedValue) error {
+	if nv.Value == nil {
+		return nil
+	}
+	if _, ok := nv.Value.(uint64); ok {
+		return nil
+	}
+	var err error
+	nv.Value, err = driver.DefaultParameterConverter.ConvertValue(nv.Value)
+	return err
+}
+
+func toNamedValues(vals []driver.Value) []driver.NamedValue {
+	r := make([]driver.NamedValue, len(vals))
 	for i, val := range vals {
 		r[i] = driver.NamedValue{Value: val, Ordinal: i + 1}
 	}
@@ -130,46 +123,78 @@ func (r *rows) Close() error {
 }
 
 func (r *rows) Next(dest []driver.Value) error {
-	if r.data == nil || r.data.Rows == nil || r.index >= len(r.data.Rows) {
+	if r.data == nil || r.index >= len(r.data.Rows) {
 		return io.EOF
 	}
 	row := r.data.Rows[r.index]
-	for i, val := range row.GetValues() {
-		dest[i] = haconnect.FromAnypb(val)
+	values := row.GetValues()
+	if len(values) > len(dest) {
+		return fmt.Errorf("remote-ha: row has %d values, destination has %d", len(values), len(dest))
+	}
+	for i := range dest {
+		if i < len(values) {
+			dest[i] = normalizeDriverValue(haconnect.FromAnypb(values[i]))
+		} else {
+			dest[i] = nil
+		}
 	}
 	r.index++
 	return nil
 }
 
-type tx struct {
-	ctx context.Context
-	ex  *executor
+func normalizeDriverValue(v any) driver.Value {
+	switch val := v.(type) {
+	case nil:
+		return nil
+	case int64, float64, bool, []byte, string, time.Time:
+		return val
+	case int32:
+		return int64(val)
+	case int:
+		return int64(val)
+	case uint32:
+		return int64(val)
+	case uint64:
+		if val <= math.MaxInt64 {
+			return int64(val)
+		}
+		return strconv.FormatUint(val, 10)
+	case float32:
+		return float64(val)
+	default:
+		return fmt.Sprint(val)
+	}
 }
 
-func (tx *tx) Commit() error {
-	resp := tx.ex.exec(tx.ctx, &sqlv1.QueryRequest{
+type tx struct {
+	ctx  context.Context
+	conn *conn
+}
+
+func (t *tx) Commit() error {
+	_, err := t.conn.roundTrip(t.ctx, &sqlv1.QueryRequest{
 		Type: sqlv1.QueryType_QUERY_TYPE_EXEC_UPDATE,
 		Sql:  "COMMIT",
 	})
-	if resp.Error != "" {
-		if resp.BadConn {
-			return fmt.Errorf("%w: %s", driver.ErrBadConn, resp.Error)
-		}
-		return errors.New(resp.Error)
+	if err != nil {
+		t.conn.markBadAndCancel()
+		return err
 	}
 	return nil
 }
 
-func (tx *tx) Rollback() error {
-	resp := tx.ex.exec(tx.ctx, &sqlv1.QueryRequest{
+func (t *tx) Rollback() error {
+	// Use an independent context because database/sql invokes Rollback after t.ctx is canceled.
+	ctx, cancel := context.WithTimeout(context.Background(), rollbackTimeout)
+	defer cancel()
+
+	_, err := t.conn.roundTrip(ctx, &sqlv1.QueryRequest{
 		Type: sqlv1.QueryType_QUERY_TYPE_EXEC_UPDATE,
 		Sql:  "ROLLBACK",
 	})
-	if resp.Error != "" {
-		if resp.BadConn {
-			return fmt.Errorf("%w: %s", driver.ErrBadConn, resp.Error)
-		}
-		return errors.New(resp.Error)
+	if err != nil {
+		t.conn.markBadAndCancel()
+		return err
 	}
 	return nil
 }
