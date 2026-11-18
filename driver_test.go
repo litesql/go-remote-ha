@@ -2,12 +2,21 @@ package remoteha
 
 import (
 	"context"
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
+	"crypto/tls"
+	"crypto/x509"
+	"crypto/x509/pkix"
 	"database/sql"
 	"database/sql/driver"
 	"errors"
+	"fmt"
 	"io"
 	"math"
+	"math/big"
 	"net"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -18,6 +27,7 @@ import (
 	haconnect "github.com/litesql/go-ha/connect"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/credentials"
 	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/status"
 	"google.golang.org/grpc/test/bufconn"
@@ -138,28 +148,34 @@ func openTestDB(t *testing.T, dsn string, lis *bufconn.Listener) *sql.DB {
 
 func TestParseDSN(t *testing.T) {
 	tests := []struct {
-		name      string
-		dsn       string
-		wantErr   bool
-		wantHost  string
-		wantRepl  string
-		wantToken string
-		wantTLS   bool
-		wantSkipV bool
-		wantKA    time.Duration
+		name         string
+		dsn          string
+		wantErr      bool
+		wantHost     string
+		wantHosts    []string
+		wantRepl     string
+		wantToken    string
+		wantTLS      bool
+		wantSkipV    bool
+		wantKA       time.Duration
+		wantLB       string
+		wantResolver string
+		wantAuth     string
 	}{
 		{
-			name:     "http insecure with path",
-			dsn:      "http://localhost:8080/mydb",
-			wantHost: "localhost:8080",
-			wantRepl: "mydb",
-			wantTLS:  false,
-			wantKA:   defaultKeepaliveInterval,
+			name:      "http insecure with path",
+			dsn:       "http://localhost:8080/mydb",
+			wantHost:  "localhost:8080",
+			wantHosts: []string{"localhost:8080"},
+			wantRepl:  "mydb",
+			wantTLS:   false,
+			wantKA:    defaultKeepaliveInterval,
 		},
 		{
 			name:      "https with colon password token",
 			dsn:       "https://:secret-token@db.example.com:443/prod",
 			wantHost:  "db.example.com:443",
+			wantHosts: []string{"db.example.com:443"},
 			wantRepl:  "prod",
 			wantToken: "secret-token",
 			wantTLS:   true,
@@ -169,6 +185,7 @@ func TestParseDSN(t *testing.T) {
 			name:      "https with user-only token",
 			dsn:       "https://bare-token@db.example.com:443/prod",
 			wantHost:  "db.example.com:443",
+			wantHosts: []string{"db.example.com:443"},
 			wantRepl:  "prod",
 			wantToken: "bare-token",
 			wantTLS:   true,
@@ -178,6 +195,7 @@ func TestParseDSN(t *testing.T) {
 			name:      "grpcs with query options",
 			dsn:       "grpcs://db.example.com:9090?replID=shard1&token=qtoken&insecureSkipVerify=true&keepalive=10s",
 			wantHost:  "db.example.com:9090",
+			wantHosts: []string{"db.example.com:9090"},
 			wantRepl:  "shard1",
 			wantToken: "qtoken",
 			wantTLS:   true,
@@ -185,12 +203,55 @@ func TestParseDSN(t *testing.T) {
 			wantKA:    10 * time.Second,
 		},
 		{
-			name:     "https overridden with insecure=true and keepalive=0",
-			dsn:      "https://localhost:8443/test?insecure=true&keepalive=0s",
-			wantHost: "localhost:8443",
-			wantRepl: "test",
-			wantTLS:  false,
-			wantKA:   0,
+			name:      "https overridden with insecure=true and keepalive=0",
+			dsn:       "https://localhost:8443/test?insecure=true&keepalive=0s",
+			wantHost:  "localhost:8443",
+			wantHosts: []string{"localhost:8443"},
+			wantRepl:  "test",
+			wantTLS:   false,
+			wantKA:    0,
+		},
+		{
+			name:      "multi-host defaults to round_robin and deduplicates hosts",
+			dsn:       "https://:my-secret@node1.example.com:8443,node2.example.com:8443,node1.example.com:8443/mydb",
+			wantHost:  "node1.example.com:8443,node2.example.com:8443",
+			wantHosts: []string{"node1.example.com:8443", "node2.example.com:8443"},
+			wantRepl:  "mydb",
+			wantToken: "my-secret",
+			wantTLS:   true,
+			wantKA:    defaultKeepaliveInterval,
+			wantLB:    LoadBalancerRoundRobin,
+		},
+		{
+			name:      "multi-host ipv6 with least_request and serverName",
+			dsn:       "grpcs://[::1]:8443,[::1]:8444/clusterdb?loadBalancer=least_request&serverName=cluster.internal",
+			wantHost:  "[::1]:8443,[::1]:8444",
+			wantHosts: []string{"[::1]:8443", "[::1]:8444"},
+			wantRepl:  "clusterdb",
+			wantTLS:   true,
+			wantKA:    defaultKeepaliveInterval,
+			wantLB:    LoadBalancerLeastRequest,
+			wantAuth:  "cluster.internal",
+		},
+		{
+			name:         "single host with dns resolver and round_robin",
+			dsn:          "grpc://db-headless.default.svc:8080/mydb?resolver=dns&loadBalancingPolicy=roundrobin",
+			wantHost:     "db-headless.default.svc:8080",
+			wantHosts:    []string{"db-headless.default.svc:8080"},
+			wantRepl:     "mydb",
+			wantTLS:      false,
+			wantKA:       defaultKeepaliveInterval,
+			wantLB:       LoadBalancerRoundRobin,
+			wantResolver: "dns",
+		},
+		{
+			name:      "multi-host explicit pick_first",
+			dsn:       "http://node1:8080,node2:8080/mydb?lb=pick-first",
+			wantHost:  "node1:8080,node2:8080",
+			wantHosts: []string{"node1:8080", "node2:8080"},
+			wantRepl:  "mydb",
+			wantKA:    defaultKeepaliveInterval,
+			wantLB:    LoadBalancerPickFirst,
 		},
 		{
 			name:    "empty dsn",
@@ -210,6 +271,31 @@ func TestParseDSN(t *testing.T) {
 		{
 			name:    "missing host",
 			dsn:     "http:///mydb",
+			wantErr: true,
+		},
+		{
+			name:    "empty host in multi-host list",
+			dsn:     "http://node1:8080,/mydb",
+			wantErr: true,
+		},
+		{
+			name:    "invalid port in multi-host list",
+			dsn:     "http://node1:8080,node2:notaport/mydb",
+			wantErr: true,
+		},
+		{
+			name:    "unsupported load balancer policy",
+			dsn:     "http://localhost:8080/mydb?loadBalancer=nonexistent_policy",
+			wantErr: true,
+		},
+		{
+			name:    "resolver combined with multi-host",
+			dsn:     "http://node1:8080,node2:8080/mydb?resolver=dns",
+			wantErr: true,
+		},
+		{
+			name:    "invalid resolver scheme",
+			dsn:     "http://localhost:8080/mydb?resolver=123bad!",
 			wantErr: true,
 		},
 		{
@@ -239,6 +325,9 @@ func TestParseDSN(t *testing.T) {
 			if cfg.host != tc.wantHost {
 				t.Errorf("host = %q, want %q", cfg.host, tc.wantHost)
 			}
+			if !slices.Equal(cfg.hosts, tc.wantHosts) {
+				t.Errorf("hosts = %v, want %v", cfg.hosts, tc.wantHosts)
+			}
 			if cfg.replicationID != tc.wantRepl {
 				t.Errorf("replicationID = %q, want %q", cfg.replicationID, tc.wantRepl)
 			}
@@ -253,6 +342,15 @@ func TestParseDSN(t *testing.T) {
 			}
 			if cfg.keepaliveInterval != tc.wantKA {
 				t.Errorf("keepaliveInterval = %v, want %v", cfg.keepaliveInterval, tc.wantKA)
+			}
+			if cfg.loadBalancingPolicy != tc.wantLB {
+				t.Errorf("loadBalancingPolicy = %q, want %q", cfg.loadBalancingPolicy, tc.wantLB)
+			}
+			if cfg.resolver != tc.wantResolver {
+				t.Errorf("resolver = %q, want %q", cfg.resolver, tc.wantResolver)
+			}
+			if cfg.authority != tc.wantAuth {
+				t.Errorf("authority = %q, want %q", cfg.authority, tc.wantAuth)
 			}
 		})
 	}
@@ -620,4 +718,421 @@ func TestPingEvictsBrokenStreamAndConcurrentUsage(t *testing.T) {
 		}()
 	}
 	wg.Wait()
+}
+
+type mockCluster struct {
+	mu        sync.RWMutex
+	listeners map[string]*bufconn.Listener
+	stops     map[string]func()
+}
+
+func newMockCluster() *mockCluster {
+	return &mockCluster{
+		listeners: make(map[string]*bufconn.Listener),
+		stops:     make(map[string]func()),
+	}
+}
+
+func (mc *mockCluster) addNode(t *testing.T, addr string, srv *mockDatabaseServer, serverOpts ...grpc.ServerOption) {
+	t.Helper()
+	lis := bufconn.Listen(1024 * 1024)
+	grpcSrv := grpc.NewServer(serverOpts...)
+	sqlv1.RegisterDatabaseServiceServer(grpcSrv, srv)
+
+	go func() {
+		_ = grpcSrv.Serve(lis)
+	}()
+
+	var stopOnce sync.Once
+	stopFn := func() {
+		stopOnce.Do(func() {
+			mc.mu.Lock()
+			delete(mc.listeners, addr)
+			mc.mu.Unlock()
+			grpcSrv.Stop()
+			_ = lis.Close()
+		})
+	}
+	t.Cleanup(stopFn)
+
+	mc.mu.Lock()
+	mc.listeners[addr] = lis
+	mc.stops[addr] = stopFn
+	mc.mu.Unlock()
+}
+
+func (mc *mockCluster) stopNode(addr string) {
+	mc.mu.RLock()
+	stopFn := mc.stops[addr]
+	mc.mu.RUnlock()
+	if stopFn != nil {
+		stopFn()
+	}
+}
+
+func (mc *mockCluster) dialOption() grpc.DialOption {
+	return grpc.WithContextDialer(func(ctx context.Context, addr string) (net.Conn, error) {
+		mc.mu.RLock()
+		lis, ok := mc.listeners[addr]
+		mc.mu.RUnlock()
+		if !ok {
+			return nil, fmt.Errorf("connection refused: %s", addr)
+		}
+		return lis.DialContext(ctx)
+	})
+}
+
+func TestMultiHostRoundRobinLoadBalancing(t *testing.T) {
+	cluster := newMockCluster()
+	srv1 := &mockDatabaseServer{expectedToken: "lb-secret"}
+	srv2 := &mockDatabaseServer{expectedToken: "lb-secret"}
+	srv3 := &mockDatabaseServer{expectedToken: "lb-secret"}
+
+	cluster.addNode(t, "node1:8080", srv1)
+	cluster.addNode(t, "node2:8080", srv2)
+	cluster.addNode(t, "node3:8080", srv3)
+
+	connector, err := NewConnector(
+		"http://:lb-secret@node1:8080,node2:8080,node3:8080/mydb",
+		cluster.dialOption(),
+	)
+	if err != nil {
+		t.Fatalf("NewConnector failed: %v", err)
+	}
+	db := sql.OpenDB(connector)
+	t.Cleanup(func() { _ = db.Close() })
+	db.SetMaxIdleConns(0) // Force every Ping to open a new stream through the gRPC picker.
+
+	// Wait until all 3 subchannels finish connecting and enter the round_robin ready set.
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if err := db.PingContext(context.Background()); err != nil {
+			t.Fatalf("warmup PingContext failed: %v", err)
+		}
+		if srv1.streamCount.Load() > 0 && srv2.streamCount.Load() > 0 && srv3.streamCount.Load() > 0 {
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	if srv1.streamCount.Load() == 0 || srv2.streamCount.Load() == 0 || srv3.streamCount.Load() == 0 {
+		t.Fatalf("not all backends became ready: counts = [%d, %d, %d]",
+			srv1.streamCount.Load(), srv2.streamCount.Load(), srv3.streamCount.Load())
+	}
+
+	base1 := srv1.streamCount.Load()
+	base2 := srv2.streamCount.Load()
+	base3 := srv3.streamCount.Load()
+
+	// Once all 3 subchannels are Ready, 9 consecutive streams must hit each server exactly 3 times.
+	for i := 0; i < 9; i++ {
+		if err := db.PingContext(context.Background()); err != nil {
+			t.Fatalf("PingContext %d failed: %v", i, err)
+		}
+	}
+
+	got1 := srv1.streamCount.Load() - base1
+	got2 := srv2.streamCount.Load() - base2
+	got3 := srv3.streamCount.Load() - base3
+	if got1 != 3 || got2 != 3 || got3 != 3 {
+		t.Errorf("round_robin stream delta = [%d, %d, %d], want [3, 3, 3]", got1, got2, got3)
+	}
+}
+
+func TestMultiHostFailoverWhenNodeDown(t *testing.T) {
+	cluster := newMockCluster()
+	makeSrv := func(name string) *mockDatabaseServer {
+		return &mockDatabaseServer{
+			handler: func(ctx context.Context, req *sqlv1.QueryRequest) (*sqlv1.QueryResponse, error) {
+				v, _ := anypb.New(wrapperspb.String(name))
+				return &sqlv1.QueryResponse{
+					ResultSet: &sqlv1.Data{
+						Columns: []string{"node"},
+						Rows:    []*sqlv1.Row{{Values: []*anypb.Any{v}}},
+					},
+				}, nil
+			},
+		}
+	}
+
+	srv1 := makeSrv("node1")
+	srv2 := makeSrv("node2")
+	cluster.addNode(t, "node1:8080", srv1)
+	cluster.addNode(t, "node2:8080", srv2)
+
+	// First endpoint "dead-node:8080" is completely unreachable from the start.
+	connector, err := NewConnector(
+		"http://dead-node:8080,node1:8080,node2:8080/mydb",
+		cluster.dialOption(),
+	)
+	if err != nil {
+		t.Fatalf("NewConnector failed: %v", err)
+	}
+	db := sql.OpenDB(connector)
+	t.Cleanup(func() { _ = db.Close() })
+	db.SetMaxOpenConns(4)
+	db.SetMaxIdleConns(4)
+
+	// Open 4 concurrent connections so both node1 and node2 hold active pooled streams.
+	conns := make([]*sql.Conn, 4)
+	for i := range conns {
+		c, err := db.Conn(context.Background())
+		if err != nil {
+			t.Fatalf("db.Conn(%d) failed despite healthy nodes: %v", i, err)
+		}
+		if err := c.PingContext(context.Background()); err != nil {
+			t.Fatalf("conn.PingContext(%d) failed: %v", i, err)
+		}
+		conns[i] = c
+	}
+	for _, c := range conns {
+		_ = c.Close()
+	}
+
+	// Shut down node1 abruptly; database/sql must evict broken streams and route traffic to node2.
+	cluster.stopNode("node1:8080")
+
+	for i := 0; i < 8; i++ {
+		var node string
+		if err := db.QueryRowContext(context.Background(), "SELECT node").Scan(&node); err != nil {
+			t.Fatalf("QueryRowContext(%d) after node1 shutdown failed: %v", i, err)
+		}
+		if node != "node2" {
+			t.Fatalf("got response from %q after node1 shutdown, want node2", node)
+		}
+	}
+}
+
+func TestMultiHostPickFirstAndFailover(t *testing.T) {
+	cluster := newMockCluster()
+	srv1 := &mockDatabaseServer{}
+	srv2 := &mockDatabaseServer{}
+	cluster.addNode(t, "node1:8080", srv1)
+	cluster.addNode(t, "node2:8080", srv2)
+
+	connector, err := NewConnector(
+		"http://node1:8080,node2:8080/mydb?loadBalancer=pick_first",
+		cluster.dialOption(),
+	)
+	if err != nil {
+		t.Fatalf("NewConnector failed: %v", err)
+	}
+	db := sql.OpenDB(connector)
+	t.Cleanup(func() { _ = db.Close() })
+	db.SetMaxIdleConns(0)
+
+	for i := 0; i < 5; i++ {
+		if err := db.PingContext(context.Background()); err != nil {
+			t.Fatalf("PingContext(%d) failed: %v", i, err)
+		}
+	}
+
+	if got1, got2 := srv1.streamCount.Load(), srv2.streamCount.Load(); got1 != 5 || got2 != 0 {
+		t.Fatalf("pick_first counts = [%d, %d], want [5, 0]", got1, got2)
+	}
+
+	// Stop primary node1; pick_first must fail over to node2.
+	cluster.stopNode("node1:8080")
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	for i := 0; i < 3; i++ {
+		if err := db.PingContext(ctx); err != nil {
+			t.Fatalf("PingContext(%d) after failover failed: %v", i, err)
+		}
+	}
+	if got2 := srv2.streamCount.Load(); got2 != 3 {
+		t.Fatalf("srv2 streamCount after failover = %d, want 3", got2)
+	}
+}
+
+func TestLeastRequestAndDialOptionLoadBalancing(t *testing.T) {
+	cluster := newMockCluster()
+	srv1 := &mockDatabaseServer{}
+	srv2 := &mockDatabaseServer{}
+	// Also verifies default port :80 normalization when port is omitted on http:// hosts.
+	cluster.addNode(t, "node1:80", srv1)
+	cluster.addNode(t, "node2:80", srv2)
+
+	connector, err := NewConnector(
+		"http://node1,node2/mydb?loadBalancer=least_request",
+		cluster.dialOption(),
+	)
+	if err != nil {
+		t.Fatalf("NewConnector failed: %v", err)
+	}
+	db := sql.OpenDB(connector)
+	t.Cleanup(func() { _ = db.Close() })
+	db.SetMaxIdleConns(0)
+
+	// Hold one stream busy on whichever node is picked first, then open additional streams:
+	// least_request_experimental must prefer the idle backend.
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if err := db.PingContext(context.Background()); err != nil {
+			t.Fatalf("PingContext failed: %v", err)
+		}
+		if srv1.streamCount.Load() > 0 && srv2.streamCount.Load() > 0 {
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	if srv1.streamCount.Load() == 0 || srv2.streamCount.Load() == 0 {
+		t.Fatalf("expected least_request to distribute across both backends, got [%d, %d]",
+			srv1.streamCount.Load(), srv2.streamCount.Load())
+	}
+
+	// Verify programmatic WithLoadBalancingPolicy helper option as well.
+	connectorOpt, err := NewConnector(
+		"http://node1,node2/mydb?loadBalancer=pick_first",
+		cluster.dialOption(),
+		WithLoadBalancingPolicy(LoadBalancerRoundRobin),
+	)
+	if err != nil {
+		t.Fatalf("NewConnector with WithLoadBalancingPolicy failed: %v", err)
+	}
+	dbOpt := sql.OpenDB(connectorOpt)
+	t.Cleanup(func() { _ = dbOpt.Close() })
+	dbOpt.SetMaxIdleConns(0)
+
+	before1, before2 := srv1.streamCount.Load(), srv2.streamCount.Load()
+	deadline = time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if err := dbOpt.PingContext(context.Background()); err != nil {
+			t.Fatalf("dbOpt PingContext failed: %v", err)
+		}
+		if srv1.streamCount.Load() > before1 && srv2.streamCount.Load() > before2 {
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	if srv1.streamCount.Load() == before1 || srv2.streamCount.Load() == before2 {
+		t.Fatalf("expected WithLoadBalancingPolicy(LoadBalancerRoundRobin) override to hit both nodes")
+	}
+}
+
+func generateTestCAAndCert(t *testing.T, caCert *x509.Certificate, caKey *ecdsa.PrivateKey, dnsNames ...string) tls.Certificate {
+	t.Helper()
+	priv, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatalf("GenerateKey failed: %v", err)
+	}
+	tmpl := &x509.Certificate{
+		SerialNumber: big.NewInt(time.Now().UnixNano()),
+		Subject:      pkix.Name{CommonName: dnsNames[0]},
+		NotBefore:    time.Now().Add(-time.Hour),
+		NotAfter:     time.Now().Add(time.Hour),
+		KeyUsage:     x509.KeyUsageDigitalSignature,
+		ExtKeyUsage:  []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+		DNSNames:     dnsNames,
+	}
+	der, err := x509.CreateCertificate(rand.Reader, tmpl, caCert, &priv.PublicKey, caKey)
+	if err != nil {
+		t.Fatalf("CreateCertificate failed: %v", err)
+	}
+	return tls.Certificate{
+		Certificate: [][]byte{der},
+		PrivateKey:  priv,
+	}
+}
+
+func TestMultiHostTLSVerificationAndAuthorityOverride(t *testing.T) {
+	caKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatalf("CA GenerateKey failed: %v", err)
+	}
+	caTmpl := &x509.Certificate{
+		SerialNumber:          big.NewInt(1),
+		Subject:               pkix.Name{CommonName: "test-ca"},
+		NotBefore:             time.Now().Add(-time.Hour),
+		NotAfter:              time.Now().Add(time.Hour),
+		KeyUsage:              x509.KeyUsageCertSign | x509.KeyUsageCRLSign,
+		BasicConstraintsValid: true,
+		IsCA:                  true,
+	}
+	caDER, err := x509.CreateCertificate(rand.Reader, caTmpl, caTmpl, &caKey.PublicKey, caKey)
+	if err != nil {
+		t.Fatalf("CA CreateCertificate failed: %v", err)
+	}
+	caCert, err := x509.ParseCertificate(caDER)
+	if err != nil {
+		t.Fatalf("ParseCertificate failed: %v", err)
+	}
+	pool := x509.NewCertPool()
+	pool.AddCert(caCert)
+
+	t.Run("distinct per-endpoint DNS certificates", func(t *testing.T) {
+		cluster := newMockCluster()
+		srv1 := &mockDatabaseServer{expectedToken: "tls-tok"}
+		srv2 := &mockDatabaseServer{expectedToken: "tls-tok"}
+
+		cert1 := generateTestCAAndCert(t, caCert, caKey, "node1.example.com")
+		cert2 := generateTestCAAndCert(t, caCert, caKey, "node2.example.com")
+
+		cluster.addNode(t, "node1.example.com:8443", srv1, grpc.Creds(credentials.NewTLS(&tls.Config{Certificates: []tls.Certificate{cert1}})))
+		cluster.addNode(t, "node2.example.com:8443", srv2, grpc.Creds(credentials.NewTLS(&tls.Config{Certificates: []tls.Certificate{cert2}})))
+
+		connector, err := NewConnector(
+			"grpcs://:tls-tok@node1.example.com:8443,node2.example.com:8443/mydb",
+			cluster.dialOption(),
+			grpc.WithTransportCredentials(credentials.NewTLS(&tls.Config{RootCAs: pool})),
+		)
+		if err != nil {
+			t.Fatalf("NewConnector failed: %v", err)
+		}
+		db := sql.OpenDB(connector)
+		t.Cleanup(func() { _ = db.Close() })
+		db.SetMaxIdleConns(0)
+
+		deadline := time.Now().Add(2 * time.Second)
+		for time.Now().Before(deadline) {
+			if err := db.PingContext(context.Background()); err != nil {
+				t.Fatalf("TLS PingContext failed: %v", err)
+			}
+			if srv1.streamCount.Load() > 0 && srv2.streamCount.Load() > 0 {
+				break
+			}
+			time.Sleep(5 * time.Millisecond)
+		}
+		if srv1.streamCount.Load() == 0 || srv2.streamCount.Load() == 0 {
+			t.Fatalf("expected TLS round_robin across both nodes, got [%d, %d]",
+				srv1.streamCount.Load(), srv2.streamCount.Load())
+		}
+	})
+
+	t.Run("shared certificate with serverName override on IP endpoints", func(t *testing.T) {
+		cluster := newMockCluster()
+		srv1 := &mockDatabaseServer{}
+		srv2 := &mockDatabaseServer{}
+
+		sharedCert := generateTestCAAndCert(t, caCert, caKey, "cluster.example.com")
+		cluster.addNode(t, "10.0.0.1:8443", srv1, grpc.Creds(credentials.NewTLS(&tls.Config{Certificates: []tls.Certificate{sharedCert}})))
+		cluster.addNode(t, "10.0.0.2:8443", srv2, grpc.Creds(credentials.NewTLS(&tls.Config{Certificates: []tls.Certificate{sharedCert}})))
+
+		connector, err := NewConnector(
+			"https://10.0.0.1:8443,10.0.0.2:8443/mydb?serverName=cluster.example.com",
+			cluster.dialOption(),
+			grpc.WithTransportCredentials(credentials.NewTLS(&tls.Config{RootCAs: pool})),
+		)
+		if err != nil {
+			t.Fatalf("NewConnector failed: %v", err)
+		}
+		db := sql.OpenDB(connector)
+		t.Cleanup(func() { _ = db.Close() })
+		db.SetMaxIdleConns(0)
+
+		deadline := time.Now().Add(2 * time.Second)
+		for time.Now().Before(deadline) {
+			if err := db.PingContext(context.Background()); err != nil {
+				t.Fatalf("TLS PingContext with serverName override failed: %v", err)
+			}
+			if srv1.streamCount.Load() > 0 && srv2.streamCount.Load() > 0 {
+				break
+			}
+			time.Sleep(5 * time.Millisecond)
+		}
+		if srv1.streamCount.Load() == 0 || srv2.streamCount.Load() == 0 {
+			t.Fatalf("expected TLS round_robin with serverName override across both IPs, got [%d, %d]",
+				srv1.streamCount.Load(), srv2.streamCount.Load())
+		}
+	})
 }

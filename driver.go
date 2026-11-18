@@ -5,9 +5,11 @@ import (
 	"crypto/tls"
 	"database/sql"
 	"database/sql/driver"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/url"
 	"strconv"
 	"strings"
@@ -16,11 +18,32 @@ import (
 
 	sqlv1 "github.com/litesql/go-ha/api/sql/v1"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/balancer"
+	_ "google.golang.org/grpc/balancer/leastrequest" // Register least_request_experimental balancer.
 	"google.golang.org/grpc/credentials"
 	"google.golang.org/grpc/credentials/insecure"
+	"google.golang.org/grpc/resolver"
 )
 
-const defaultKeepaliveInterval = 25 * time.Second
+const (
+	defaultKeepaliveInterval = 25 * time.Second
+	multiHostScheme          = "remoteha-static"
+
+	// LoadBalancerPickFirst connects to the first reachable endpoint and fails over on disconnect.
+	LoadBalancerPickFirst = "pick_first"
+	// LoadBalancerRoundRobin distributes new RPC streams evenly across all healthy endpoints.
+	LoadBalancerRoundRobin = "round_robin"
+	// LoadBalancerLeastRequest routes new RPC streams to the healthy endpoint with the fewest active streams.
+	LoadBalancerLeastRequest = "least_request_experimental"
+)
+
+// WithLoadBalancingPolicy returns a grpc.DialOption that configures the default
+// gRPC client-side load balancing policy (for example, LoadBalancerRoundRobin,
+// LoadBalancerLeastRequest, or LoadBalancerPickFirst).
+func WithLoadBalancingPolicy(policy string) grpc.DialOption {
+	normalized := normalizeLoadBalancingPolicy(strings.TrimSpace(policy))
+	return grpc.WithDefaultServiceConfig(buildLoadBalancingServiceConfig(normalized))
+}
 
 func init() {
 	sql.Register("remote-ha", drv)
@@ -134,48 +157,81 @@ func (c *Connector) getClientConn() (*grpc.ClientConn, *dsnConfig, error) {
 }
 
 type dsnConfig struct {
-	host               string
-	replicationID      string
-	token              string
-	useTLS             bool
-	insecureSkipVerify bool
-	keepaliveInterval  time.Duration
+	scheme              string
+	host                string
+	hosts               []string
+	replicationID       string
+	token               string
+	useTLS              bool
+	insecureSkipVerify  bool
+	keepaliveInterval   time.Duration
+	loadBalancingPolicy string
+	resolver            string
+	authority           string
 }
 
 func parseDSN(name string) (*dsnConfig, error) {
-	if strings.TrimSpace(name) == "" {
+	trimmed := strings.TrimSpace(name)
+	if trimmed == "" {
 		return nil, errors.New("remote-ha: empty DSN")
 	}
 
-	u, err := url.Parse(name)
-	if err != nil {
-		return nil, fmt.Errorf("remote-ha: parse url: %w", err)
+	rawScheme, rest, ok := strings.Cut(trimmed, "://")
+	if !ok || rawScheme == "" {
+		return nil, errors.New("remote-ha: missing URL scheme (expected http://, https://, grpc://, or grpcs://)")
 	}
+	scheme := strings.ToLower(rawScheme)
 
 	var useTLS bool
-	switch u.Scheme {
+	switch scheme {
 	case "http", "grpc":
 		useTLS = false
 	case "https", "grpcs":
 		useTLS = true
-	case "":
-		return nil, errors.New("remote-ha: missing URL scheme (expected http://, https://, grpc://, or grpcs://)")
 	default:
-		if u.Host == "" {
-			return nil, errors.New("remote-ha: missing URL scheme (expected http://, https://, grpc://, or grpcs://)")
-		}
-		return nil, fmt.Errorf("remote-ha: unsupported URL scheme %q (expected http, https, grpc, or grpcs)", u.Scheme)
+		return nil, fmt.Errorf("remote-ha: unsupported URL scheme %q (expected http, https, grpc, or grpcs)", rawScheme)
 	}
 
-	if u.Host == "" {
+	var authorityPart, tail string
+	if idx := strings.IndexAny(rest, "/?#"); idx >= 0 {
+		authorityPart = rest[:idx]
+		tail = rest[idx:]
+	} else {
+		authorityPart = rest
+	}
+
+	var userPrefix, rawHosts string
+	if atIdx := strings.LastIndex(authorityPart, "@"); atIdx >= 0 {
+		userPrefix = authorityPart[:atIdx+1]
+		rawHosts = authorityPart[atIdx+1:]
+	} else {
+		rawHosts = authorityPart
+	}
+
+	if strings.TrimSpace(rawHosts) == "" {
 		return nil, errors.New("remote-ha: missing host in DSN")
 	}
 
+	hosts, err := parseHosts(scheme, rawHosts)
+	if err != nil {
+		return nil, err
+	}
+
+	u, err := url.Parse(scheme + "://" + userPrefix + "localhost" + tail)
+	if err != nil {
+		return nil, fmt.Errorf("remote-ha: parse url: %w", err)
+	}
+
 	cfg := &dsnConfig{
-		host:              u.Host,
+		scheme:            scheme,
+		host:              strings.Join(hosts, ","),
+		hosts:             hosts,
 		replicationID:     strings.TrimPrefix(u.Path, "/"),
 		useTLS:            useTLS,
 		keepaliveInterval: defaultKeepaliveInterval,
+	}
+	if len(hosts) > 1 {
+		cfg.loadBalancingPolicy = LoadBalancerRoundRobin
 	}
 
 	if u.User != nil {
@@ -233,13 +289,164 @@ func parseDSN(name string) (*dsnConfig, error) {
 			}
 			cfg.keepaliveInterval = d
 		}
+
+		if v := firstNonEmpty(q, "loadBalancingPolicy", "loadBalancer", "lbPolicy", "lb"); v != "" {
+			policy := normalizeLoadBalancingPolicy(v)
+			if balancer.Get(policy) == nil {
+				return nil, fmt.Errorf("remote-ha: unsupported load balancer %q", v)
+			}
+			cfg.loadBalancingPolicy = policy
+		}
+
+		if v := strings.TrimSpace(q.Get("resolver")); v != "" {
+			if len(cfg.hosts) > 1 {
+				return nil, errors.New("remote-ha: resolver query param cannot be combined with multiple hosts in DSN")
+			}
+			if !isValidScheme(v) {
+				return nil, fmt.Errorf("remote-ha: invalid resolver scheme %q", v)
+			}
+			cfg.resolver = strings.ToLower(v)
+		}
+
+		if v := firstNonEmpty(q, "authority", "serverName"); v != "" {
+			cfg.authority = v
+		}
 	}
 
 	return cfg, nil
 }
 
+func parseHosts(scheme, rawHosts string) ([]string, error) {
+	parts := strings.Split(rawHosts, ",")
+	hosts := make([]string, 0, len(parts))
+	seen := make(map[string]struct{}, len(parts))
+
+	for _, part := range parts {
+		h := strings.TrimSpace(part)
+		if h == "" {
+			return nil, errors.New("remote-ha: empty host in DSN")
+		}
+		uHost, err := url.Parse(scheme + "://" + h)
+		if err != nil {
+			return nil, fmt.Errorf("remote-ha: invalid host %q: %w", h, err)
+		}
+		if uHost.User != nil || uHost.Path != "" || uHost.RawQuery != "" || uHost.Fragment != "" || uHost.Hostname() == "" {
+			return nil, fmt.Errorf("remote-ha: invalid host %q", h)
+		}
+		if _, exists := seen[uHost.Host]; !exists {
+			seen[uHost.Host] = struct{}{}
+			hosts = append(hosts, uHost.Host)
+		}
+	}
+	return hosts, nil
+}
+
+func firstNonEmpty(q url.Values, keys ...string) string {
+	for _, k := range keys {
+		if v := strings.TrimSpace(q.Get(k)); v != "" {
+			return v
+		}
+	}
+	return ""
+}
+
+func normalizeLoadBalancingPolicy(policy string) string {
+	switch strings.ToLower(strings.TrimSpace(policy)) {
+	case "round_robin", "roundrobin", "round-robin":
+		return LoadBalancerRoundRobin
+	case "pick_first", "pickfirst", "pick-first":
+		return LoadBalancerPickFirst
+	case "least_request", "leastrequest", "least-request", "least_request_experimental":
+		return LoadBalancerLeastRequest
+	default:
+		return strings.TrimSpace(policy)
+	}
+}
+
+func buildLoadBalancingServiceConfig(policy string) string {
+	payload := map[string]any{
+		"loadBalancingConfig": []map[string]any{
+			{policy: struct{}{}},
+		},
+	}
+	b, _ := json.Marshal(payload)
+	return string(b)
+}
+
+func isValidScheme(s string) bool {
+	if s == "" {
+		return false
+	}
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		isAlpha := ('a' <= c && c <= 'z') || ('A' <= c && c <= 'Z')
+		isDigit := '0' <= c && c <= '9'
+		if i == 0 && !isAlpha {
+			return false
+		}
+		if !isAlpha && !isDigit && c != '+' && c != '-' && c != '.' {
+			return false
+		}
+	}
+	return true
+}
+
+func normalizeEndpointAddr(host, scheme string) string {
+	if _, _, err := net.SplitHostPort(host); err == nil {
+		return host
+	}
+	defaultPort := "443"
+	if scheme == "http" {
+		defaultPort = "80"
+	}
+	bareHost := strings.TrimPrefix(strings.TrimSuffix(host, "]"), "[")
+	return net.JoinHostPort(bareHost, defaultPort)
+}
+
+type multiHostResolverBuilder struct {
+	addrs     []resolver.Address
+	endpoints []resolver.Endpoint
+}
+
+func newMultiHostResolverBuilder(hosts []string, scheme string) *multiHostResolverBuilder {
+	addrs := make([]resolver.Address, 0, len(hosts))
+	endpoints := make([]resolver.Endpoint, 0, len(hosts))
+	for _, h := range hosts {
+		addr := normalizeEndpointAddr(h, scheme)
+		ra := resolver.Address{
+			Addr:       addr,
+			ServerName: addr,
+		}
+		addrs = append(addrs, ra)
+		endpoints = append(endpoints, resolver.Endpoint{
+			Addresses: []resolver.Address{ra},
+		})
+	}
+	return &multiHostResolverBuilder{
+		addrs:     addrs,
+		endpoints: endpoints,
+	}
+}
+
+func (b *multiHostResolverBuilder) Scheme() string {
+	return multiHostScheme
+}
+
+func (b *multiHostResolverBuilder) Build(_ resolver.Target, cc resolver.ClientConn, _ resolver.BuildOptions) (resolver.Resolver, error) {
+	_ = cc.UpdateState(resolver.State{
+		Addresses: b.addrs,
+		Endpoints: b.endpoints,
+	})
+	return nopResolver{}, nil
+}
+
+type nopResolver struct{}
+
+func (nopResolver) ResolveNow(resolver.ResolveNowOptions) {}
+func (nopResolver) Close()                                {}
+
 func newClientConn(cfg *dsnConfig, extraOpts []grpc.DialOption) (*grpc.ClientConn, error) {
-	opts := make([]grpc.DialOption, 0, 2+len(extraOpts))
+	opts := make([]grpc.DialOption, 0, 5+len(extraOpts))
 	if cfg.useTLS {
 		opts = append(opts, grpc.WithTransportCredentials(credentials.NewTLS(&tls.Config{
 			InsecureSkipVerify: cfg.insecureSkipVerify,
@@ -255,9 +462,29 @@ func newClientConn(cfg *dsnConfig, extraOpts []grpc.DialOption) (*grpc.ClientCon
 		}))
 	}
 
+	if cfg.authority != "" {
+		opts = append(opts, grpc.WithAuthority(cfg.authority))
+	}
+
+	if cfg.loadBalancingPolicy != "" {
+		opts = append(opts, WithLoadBalancingPolicy(cfg.loadBalancingPolicy))
+	}
+
+	target := cfg.host
+	if len(cfg.hosts) > 1 {
+		rb := newMultiHostResolverBuilder(cfg.hosts, cfg.scheme)
+		opts = append(opts, grpc.WithResolvers(rb))
+		target = multiHostScheme + ":///" + normalizeEndpointAddr(cfg.hosts[0], cfg.scheme)
+	} else if len(cfg.hosts) == 1 {
+		target = cfg.hosts[0]
+		if cfg.resolver != "" {
+			target = cfg.resolver + ":///" + target
+		}
+	}
+
 	opts = append(opts, extraOpts...)
 
-	cc, err := grpc.NewClient(cfg.host, opts...)
+	cc, err := grpc.NewClient(target, opts...)
 	if err != nil {
 		return nil, fmt.Errorf("create grpc client: %w", err)
 	}

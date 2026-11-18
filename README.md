@@ -6,6 +6,7 @@
 
 ## Features
 - **Remote Access**: Connect to SQLite HA databases over gRPC (`http`, `https`, `grpc`, `grpcs`).
+- **Client-Side Load Balancing**: Distribute pooled `database/sql` streams across multiple gRPC endpoints or DNS-resolved backends (`round_robin`, `least_request`, `pick_first`).
 - **Connection Multiplexing**: Shares a single underlying gRPC connection across pooled `database/sql` streams.
 - **Easy Integration**: Works directly with Go's standard `database/sql` package.
 
@@ -42,7 +43,7 @@ func main() {
 ## DSN Format
 
 ```text
-<scheme>://[:<token>@]<host>:<port>[/<replicationID>][?<options>]
+<scheme>://[:<token>@]<host1>:<port1>[,<host2>:<port2>,...][/<replicationID>][?<options>]
 ```
 
 ### Schemes
@@ -63,12 +64,40 @@ Pass the authentication token in any of the following ways:
 | `insecure` / `grpcInsecure` | Disable TLS (`true`/`false`) | Depends on scheme |
 | `insecureSkipVerify` | Skip TLS certificate verification (`true`/`false`) | `false` |
 | `keepalive` | Stream keepalive ping interval (`0s` disables application pings) | `25s` |
+| `loadBalancingPolicy` / `loadBalancer` / `lbPolicy` / `lb` | gRPC client load balancing policy (`round_robin`, `least_request`, `pick_first`) | `round_robin` when multiple hosts are given; gRPC default otherwise |
+| `resolver` | gRPC name resolver scheme for single-target DSNs (e.g. `dns`, `passthrough`, `xds`) | gRPC default (`dns`) |
+| `authority` / `serverName` | Override HTTP/2 `:authority` and TLS `ServerName` (useful when dialing IPs with a shared TLS certificate) | Endpoint host |
 
-### Custom gRPC Dial Options
-You can pass custom `grpc.DialOption`s via `NewConnector` and `sql.OpenDB`:
+### Client-Side Load Balancing
+
+#### Multiple Static Endpoints
+Provide a comma-separated list of `host:port` endpoints in the DSN. When multiple hosts are specified, `round_robin` load balancing is enabled automatically:
 
 ```go
-connector, err := remoteha.NewConnector("https://db.example.com:8443/mydb", customDialOpts...)
+db, err := sql.Open("remote-ha", "https://:your-secret-token@node1.example.com:8443,node2.example.com:8443,node3.example.com:8443/mydb")
+```
+
+To use active-passive failover (`pick_first`) or `least_request` instead:
+
+```go
+db, err := sql.Open("remote-ha", "https://:your-secret-token@node1.example.com:8443,node2.example.com:8443/mydb?loadBalancer=least_request")
+```
+
+#### DNS Service Discovery (e.g. Kubernetes Headless Services)
+For a single hostname that resolves to multiple A/AAAA records, enable `round_robin` or `least_request` via query parameter:
+
+```go
+db, err := sql.Open("remote-ha", "https://:your-secret-token@db-headless.default.svc.cluster.local:8443/mydb?loadBalancer=round_robin")
+```
+
+### Custom gRPC Dial Options
+You can pass custom `grpc.DialOption`s (including `remoteha.WithLoadBalancingPolicy`) via `NewConnector` and `sql.OpenDB`:
+
+```go
+connector, err := remoteha.NewConnector(
+	"https://db.example.com:8443/mydb",
+	remoteha.WithLoadBalancingPolicy(remoteha.LoadBalancerRoundRobin),
+)
 if err != nil {
 	panic(err)
 }
